@@ -1,4 +1,4 @@
-"""Modified from https://github.com/guoyww/AnimateDiff/blob/main/app.py
+"""Modified from https://github.com/aigc-apps/EasyAnimate/blob/main/easyanimate/ui/ui.py
 """
 import base64
 import gc
@@ -52,6 +52,16 @@ css = """
     max-width: 2.5em;
     min-width: 2.5em !important;
     height: 2.5em;
+}
+.shield {
+    margin-right:5px;
+}
+.shields {
+    margin:0 sauto;
+    display:flex;
+}
+.img {
+    height:50px;
 }
 """
 
@@ -716,6 +726,801 @@ def ui(low_gpu_memory_mode, weight_dtype):
             )
     return demo, controller
 
+class EasyAnimateController_Casdao:
+    def __init__(self, model_dir, save_dir,low_gpu_memory_mode, weight_dtype):
+        # config dirs
+        self.basedir                    = os.getcwd()
+        self.config_dir                 = os.path.join(self.basedir, "config")
+        self.diffusion_transformer_dir  = os.path.join(model_dir, "Diffusion_Transformer")
+        self.motion_module_dir          = os.path.join(model_dir, "Motion_Module")
+        self.personalized_model_dir     = os.path.join(model_dir, "Personalized_Model")
+        self.savedir                    = os.path.join(save_dir, datetime.now().strftime("Gradio-%Y-%m-%dT%H-%M-%S"))
+        self.savedir_sample             = os.path.join(self.savedir, "sample")
+        self.edition                    = "v3"
+        self.inference_config           = OmegaConf.load(os.path.join(self.config_dir, "easyanimate_video_slicevae_motion_module_v3.yaml"))
+        os.makedirs(self.savedir, exist_ok=True)
+
+        self.diffusion_transformer_list = []
+        self.motion_module_list      = []
+        self.personalized_model_list = []
+        
+        self.refresh_diffusion_transformer()
+        self.refresh_motion_module()
+        self.refresh_personalized_model()
+
+        # config models
+        self.tokenizer             = None
+        self.text_encoder          = None
+        self.vae                   = None
+        self.transformer           = None
+        self.pipeline              = None
+        self.motion_module_path    = "none"
+        self.base_model_path       = "none"
+        self.lora_model_path       = "none"
+        self.low_gpu_memory_mode   = low_gpu_memory_mode
+        
+        self.weight_dtype = weight_dtype
+        
+        self.load_default_diffusion_transformer()
+        
+        print("启动EasyAnimate 应用界面中...")
+        print("当命令行出现local URL则说明启动成功。请回到算力互联控制台-容器实例，点击实例的”应用服务“，打开应用")
+        print("Start the UI of EasyAnimate application...")
+        print("if the URL appears in the terminal, plaease go back to the Casdao-Control Panel, then click the \"Applincation Service\" button of the instance, to open it...\n")
+
+    def refresh_diffusion_transformer(self):
+        self.diffusion_transformer_list = sorted(glob(os.path.join(self.diffusion_transformer_dir, "*/")))
+
+    def refresh_motion_module(self):
+        motion_module_list = sorted(glob(os.path.join(self.motion_module_dir, "*.safetensors")))
+        self.motion_module_list = [os.path.basename(p) for p in motion_module_list]
+
+    def refresh_personalized_model(self):
+        personalized_model_list = sorted(glob(os.path.join(self.personalized_model_dir, "*.safetensors")))
+        self.personalized_model_list = [os.path.basename(p) for p in personalized_model_list]
+    
+    def update_edition(self, edition):
+        print("Update edition of EasyAnimate")
+        self.edition = edition
+        if edition == "v1":
+            self.inference_config = OmegaConf.load(os.path.join(self.config_dir, "easyanimate_video_motion_module_v1.yaml"))
+            return gr.update(), gr.update(value="none"), gr.update(visible=True), gr.update(visible=True), \
+                gr.update(value=512, minimum=384, maximum=704, step=32), \
+                gr.update(value=512, minimum=384, maximum=704, step=32), gr.update(value=80, minimum=40, maximum=80, step=1)
+        elif edition == "v2":
+            self.inference_config = OmegaConf.load(os.path.join(self.config_dir, "easyanimate_video_magvit_motion_module_v2.yaml"))
+            return gr.update(), gr.update(value="none"), gr.update(visible=False), gr.update(visible=False), \
+                gr.update(value=672, minimum=128, maximum=1280, step=16), \
+                gr.update(value=384, minimum=128, maximum=1280, step=16), gr.update(value=144, minimum=9, maximum=144, step=9)
+        else:
+            self.inference_config = OmegaConf.load(os.path.join(self.config_dir, "easyanimate_video_slicevae_motion_module_v3.yaml"))
+            return gr.update(), gr.update(value="none"), gr.update(visible=False), gr.update(visible=False), \
+                gr.update(value=672, minimum=128, maximum=1280, step=16), \
+                gr.update(value=384, minimum=128, maximum=1280, step=16), gr.update(value=144, minimum=8, maximum=144, step=8)
+
+    def load_default_diffusion_transformer(self):
+        print("\n加载默认diffusion transformer中...")
+        print("Load default diffusion transformer...")
+        if self.diffusion_transformer_list == [] or self.diffusion_transformer_list is None or self.diffusion_transformer_list == "none":
+            return gr.update()
+        if OmegaConf.to_container(self.inference_config['vae_kwargs'])['enable_magvit']:
+            Choosen_AutoencoderKL = AutoencoderKLMagvit
+        else:
+            Choosen_AutoencoderKL = AutoencoderKL
+        self.vae = Choosen_AutoencoderKL.from_pretrained(
+            self.diffusion_transformer_list[-1], 
+            subfolder="vae", 
+        ).to(self.weight_dtype)
+        if OmegaConf.to_container(self.inference_config['vae_kwargs'])['enable_magvit'] and self.weight_dtype == torch.float16:
+            self.vae.upcast_vae = True
+        transformer_additional_kwargs = OmegaConf.to_container(self.inference_config['transformer_additional_kwargs'])
+        if self.weight_dtype == torch.float16:
+            transformer_additional_kwargs["upcast_attention"] = True
+        self.transformer = Transformer3DModel.from_pretrained_2d(
+            self.diffusion_transformer_list[-1], 
+            subfolder="transformer", 
+            transformer_additional_kwargs=transformer_additional_kwargs
+        ).to(self.weight_dtype)
+        self.tokenizer = T5Tokenizer.from_pretrained(self.diffusion_transformer_list[-1], subfolder="tokenizer")
+        self.text_encoder = T5EncoderModel.from_pretrained(self.diffusion_transformer_list[-1], subfolder="text_encoder", torch_dtype=self.weight_dtype)
+
+        # Get pipeline
+        if self.transformer.config.in_channels != 12:
+            self.pipeline = EasyAnimatePipeline(
+                vae=self.vae, 
+                text_encoder=self.text_encoder, 
+                tokenizer=self.tokenizer, 
+                transformer=self.transformer,
+                scheduler=scheduler_dict["Euler"](**OmegaConf.to_container(self.inference_config.noise_scheduler_kwargs))
+            )
+        else:
+            clip_image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+                self.diffusion_transformer_list[-1], subfolder="image_encoder"
+            ).to("cuda", self.weight_dtype)
+            clip_image_processor = CLIPImageProcessor.from_pretrained(
+                self.diffusion_transformer_list[-1], subfolder="image_encoder"
+            )
+            self.pipeline = EasyAnimateInpaintPipeline(
+                vae=self.vae, 
+                text_encoder=self.text_encoder, 
+                tokenizer=self.tokenizer, 
+                transformer=self.transformer,
+                scheduler=scheduler_dict["Euler"](**OmegaConf.to_container(self.inference_config.noise_scheduler_kwargs)),
+                clip_image_encoder=clip_image_encoder,
+                clip_image_processor=clip_image_processor,
+            )
+        if self.low_gpu_memory_mode:
+            self.pipeline.enable_sequential_cpu_offload()
+        else:
+            self.pipeline.enable_model_cpu_offload()
+        print("Load diffusion transformer done.")
+        print("加载diffusion transformer完毕。\n")
+        
+        return gr.update(), gr.update(value=self.diffusion_transformer_list[-1])
+    
+    def update_diffusion_transformer(self, diffusion_transformer_dropdown):
+        print("\n更新diffusion transformer中...")
+        print("Update diffusion transformer...")
+        if diffusion_transformer_dropdown == "none":
+            return gr.update()
+        if OmegaConf.to_container(self.inference_config['vae_kwargs'])['enable_magvit']:
+            Choosen_AutoencoderKL = AutoencoderKLMagvit
+        else:
+            Choosen_AutoencoderKL = AutoencoderKL
+        self.vae = Choosen_AutoencoderKL.from_pretrained(
+            diffusion_transformer_dropdown, 
+            subfolder="vae", 
+        ).to(self.weight_dtype)
+        if OmegaConf.to_container(self.inference_config['vae_kwargs'])['enable_magvit'] and self.weight_dtype == torch.float16:
+            self.vae.upcast_vae = True
+            
+        transformer_additional_kwargs = OmegaConf.to_container(self.inference_config['transformer_additional_kwargs'])
+        if self.weight_dtype == torch.float16:
+            transformer_additional_kwargs["upcast_attention"] = True
+        self.transformer = Transformer3DModel.from_pretrained_2d(
+            diffusion_transformer_dropdown, 
+            subfolder="transformer", 
+            transformer_additional_kwargs=transformer_additional_kwargs
+        ).to(self.weight_dtype)
+        self.tokenizer = T5Tokenizer.from_pretrained(diffusion_transformer_dropdown, subfolder="tokenizer")
+        self.text_encoder = T5EncoderModel.from_pretrained(diffusion_transformer_dropdown, subfolder="text_encoder", torch_dtype=self.weight_dtype)
+
+        # Get pipeline
+        if self.transformer.config.in_channels != 12:
+            self.pipeline = EasyAnimatePipeline(
+                vae=self.vae, 
+                text_encoder=self.text_encoder, 
+                tokenizer=self.tokenizer, 
+                transformer=self.transformer,
+                scheduler=scheduler_dict["Euler"](**OmegaConf.to_container(self.inference_config.noise_scheduler_kwargs))
+            )
+        else:
+            clip_image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+                diffusion_transformer_dropdown, subfolder="image_encoder"
+            ).to("cuda", self.weight_dtype)
+            clip_image_processor = CLIPImageProcessor.from_pretrained(
+                diffusion_transformer_dropdown, subfolder="image_encoder"
+            )
+            self.pipeline = EasyAnimateInpaintPipeline(
+                vae=self.vae, 
+                text_encoder=self.text_encoder, 
+                tokenizer=self.tokenizer, 
+                transformer=self.transformer,
+                scheduler=scheduler_dict["Euler"](**OmegaConf.to_container(self.inference_config.noise_scheduler_kwargs)),
+                clip_image_encoder=clip_image_encoder,
+                clip_image_processor=clip_image_processor,
+            )
+        if self.low_gpu_memory_mode:
+            self.pipeline.enable_sequential_cpu_offload()
+        else:
+            self.pipeline.enable_model_cpu_offload()
+        print("更新diffusion transformer完毕。")
+        print("Update diffusion transformer done.\n")
+        return gr.update()
+
+    def update_motion_module(self, motion_module_dropdown):
+        self.motion_module_path = motion_module_dropdown
+        print("Update motion module")
+        if motion_module_dropdown == "none":
+            return gr.update()
+        if self.transformer is None:
+            gr.Info(f"\nPlease select a pretrained model path.")
+            return gr.update(value=None)
+        else:
+            motion_module_dropdown = os.path.join(self.motion_module_dir, motion_module_dropdown)
+            if motion_module_dropdown.endswith(".safetensors"):
+                from safetensors.torch import load_file, safe_open
+                motion_module_state_dict = load_file(motion_module_dropdown)
+            else:
+                if not os.path.isfile(motion_module_dropdown):
+                    raise RuntimeError(f"{motion_module_dropdown} does not exist")
+                motion_module_state_dict = torch.load(motion_module_dropdown, map_location="cpu")
+            missing, unexpected = self.transformer.load_state_dict(motion_module_state_dict, strict=False)
+            print("Update motion module done.")
+            return gr.update()
+
+    def update_base_model(self, base_model_dropdown):
+        self.base_model_path = base_model_dropdown
+        print("Update base model")
+        if base_model_dropdown == "none":
+            return gr.update()
+        if self.transformer is None:
+            gr.Info(f"Please select a pretrained model path.")
+            return gr.update(value=None)
+        else:
+            base_model_dropdown = os.path.join(self.personalized_model_dir, base_model_dropdown)
+            base_model_state_dict = {}
+            with safe_open(base_model_dropdown, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    base_model_state_dict[key] = f.get_tensor(key)
+            self.transformer.load_state_dict(base_model_state_dict, strict=False)
+            print("Update base done")
+            return gr.update()
+
+    def update_lora_model(self, lora_model_dropdown):
+        print("Update lora model")
+        if lora_model_dropdown == "none":
+            self.lora_model_path = "none"
+            return gr.update()
+        lora_model_dropdown = os.path.join(self.personalized_model_dir, lora_model_dropdown)
+        self.lora_model_path = lora_model_dropdown
+        return gr.update()
+
+    def generate(
+        self,
+        diffusion_transformer_dropdown,
+        motion_module_dropdown,
+        base_model_dropdown,
+        lora_model_dropdown, 
+        lora_alpha_slider,
+        prompt_textbox, 
+        negative_prompt_textbox, 
+        sampler_dropdown, 
+        sample_step_slider, 
+        resize_method,
+        width_slider, 
+        height_slider, 
+        base_resolution, 
+        generation_method, 
+        length_slider, 
+        overlap_video_length, 
+        partial_video_length, 
+        cfg_scale_slider, 
+        start_image, 
+        end_image, 
+        seed_textbox,
+        is_api = False,
+    ):
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+        if self.transformer is None:
+            raise gr.Error(f"Please select a pretrained model path.")
+
+        if self.base_model_path != base_model_dropdown:
+            self.update_base_model(base_model_dropdown)
+
+        if self.motion_module_path != motion_module_dropdown:
+            self.update_motion_module(motion_module_dropdown)
+
+        if self.lora_model_path != lora_model_dropdown:
+            print("Update lora model")
+            self.update_lora_model(lora_model_dropdown)
+        
+        if resize_method == "Resize to the Start Image":
+            if start_image is None:
+                if is_api:
+                    return "", f"Please upload an image when using \"Resize to the Start Image\"."
+                else:
+                    raise gr.Error(f"当使用 \"Resize to the Start Image\" 时请上传图片。")
+
+            aspect_ratio_sample_size    = {key : [x / 512 * base_resolution for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
+            
+            original_width, original_height = start_image[0].size if type(start_image) is list else Image.open(start_image).size
+            closest_size, closest_ratio = get_closest_ratio(original_height, original_width, ratios=aspect_ratio_sample_size)
+            height_slider, width_slider = [int(x / 16) * 16 for x in closest_size]
+
+        if self.transformer.config.in_channels != 12 and start_image is not None:
+            if is_api:
+                return "", f"Please select an image to video pretrained model while using image to video."
+            else:
+                raise gr.Error(f"在使用图像生成视频时，请选择一个图像生成视频的预训练模型。")
+
+        if self.transformer.config.in_channels != 12 and generation_method == "Long Video Generation":
+            if is_api:
+                return "", f"Please select an image to video pretrained model while using long video generation."
+            else:
+                raise gr.Error(f"在使用长视频生成时，请选择一个图像转视频预训练模型。")
+        
+        if start_image is None and end_image is not None:
+            if is_api:
+                return "", f"If specifying the ending image of the video, please specify a starting image of the video."
+            else:
+                raise gr.Error(f"如果指定视频的结束图像，请指定视频的起始图像。")
+
+        is_image = True if generation_method == "Image Generation" else False
+
+        if is_xformers_available(): self.transformer.enable_xformers_memory_efficient_attention()
+
+        self.pipeline.scheduler = scheduler_dict[sampler_dropdown](**OmegaConf.to_container(self.inference_config.noise_scheduler_kwargs))
+        if self.lora_model_path != "none":
+            # lora part
+            self.pipeline = merge_lora(self.pipeline, self.lora_model_path, multiplier=lora_alpha_slider)
+
+        if int(seed_textbox) != -1 and seed_textbox != "": torch.manual_seed(int(seed_textbox))
+        else: seed_textbox = np.random.randint(0, 1e10)
+        generator = torch.Generator(device="cuda").manual_seed(int(seed_textbox))
+        
+        try:
+            if self.transformer.config.in_channels == 12:
+                if generation_method == "Long Video Generation":
+                    init_frames = 0
+                    last_frames = init_frames + partial_video_length
+                    while init_frames < length_slider:
+                        if last_frames >= length_slider:
+                            if self.pipeline.vae.quant_conv.weight.ndim==5:
+                                mini_batch_encoder = self.pipeline.vae.mini_batch_encoder
+                                _partial_video_length = length_slider - init_frames
+                                _partial_video_length = int(_partial_video_length // mini_batch_encoder * mini_batch_encoder)
+                            else:
+                                _partial_video_length = length_slider - init_frames
+                            
+                            if _partial_video_length <= 0:
+                                break
+                        else:
+                            _partial_video_length = partial_video_length
+
+                        if last_frames >= length_slider:
+                            input_video, input_video_mask, clip_image = get_image_to_video_latent(start_image, end_image, video_length=_partial_video_length, sample_size=(height_slider, width_slider))
+                        else:
+                            input_video, input_video_mask, clip_image = get_image_to_video_latent(start_image, None, video_length=_partial_video_length, sample_size=(height_slider, width_slider))
+
+                        with torch.no_grad():
+                            sample = self.pipeline(
+                                prompt_textbox, 
+                                negative_prompt     = negative_prompt_textbox,
+                                num_inference_steps = sample_step_slider,
+                                guidance_scale      = cfg_scale_slider,
+                                width               = width_slider,
+                                height              = height_slider,
+                                video_length        = _partial_video_length,
+                                generator           = generator,
+
+                                video        = input_video,
+                                mask_video   = input_video_mask,
+                                clip_image   = clip_image, 
+                                strength     = 1,
+                            ).videos
+                        
+                        if init_frames != 0:
+                            mix_ratio = torch.from_numpy(
+                                np.array([float(_index) / float(overlap_video_length) for _index in range(overlap_video_length)], np.float32)
+                            ).unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                            
+                            new_sample[:, :, -overlap_video_length:] = new_sample[:, :, -overlap_video_length:] * (1 - mix_ratio) + \
+                                sample[:, :, :overlap_video_length] * mix_ratio
+                            new_sample = torch.cat([new_sample, sample[:, :, overlap_video_length:]], dim = 2)
+
+                            sample = new_sample
+                        else:
+                            new_sample = sample
+
+                        if last_frames >= length_slider:
+                            break
+
+                        start_image = [
+                            Image.fromarray(
+                                (sample[0, :, _index].transpose(0, 1).transpose(1, 2) * 255).numpy().astype(np.uint8)
+                            ) for _index in range(-overlap_video_length, 0)
+                        ]
+
+                        init_frames = init_frames + _partial_video_length - overlap_video_length
+                        last_frames = init_frames + _partial_video_length
+                else:
+                    input_video, input_video_mask, clip_image = get_image_to_video_latent(start_image, end_image, length_slider if not is_image else 1, sample_size=(height_slider, width_slider))
+
+                    sample = self.pipeline(
+                        prompt_textbox,
+                        negative_prompt     = negative_prompt_textbox,
+                        num_inference_steps = sample_step_slider,
+                        guidance_scale      = cfg_scale_slider,
+                        width               = width_slider,
+                        height              = height_slider,
+                        video_length        = length_slider if not is_image else 1,
+                        generator           = generator,
+
+                        video        = input_video,
+                        mask_video   = input_video_mask,
+                        clip_image   = clip_image, 
+                    ).videos
+            else:
+                sample = self.pipeline(
+                    prompt_textbox,
+                    negative_prompt     = negative_prompt_textbox,
+                    num_inference_steps = sample_step_slider,
+                    guidance_scale      = cfg_scale_slider,
+                    width               = width_slider,
+                    height              = height_slider,
+                    video_length        = length_slider if not is_image else 1,
+                    generator           = generator
+                ).videos
+        except Exception as e:
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            if self.lora_model_path != "none":
+                self.pipeline = unmerge_lora(self.pipeline, self.lora_model_path, multiplier=lora_alpha_slider)
+            if is_api:
+                return "", f"Error. error information is {str(e)}"
+            else:
+                return gr.update(), gr.update(), f"错误。 错误信息是 {str(e)}"
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+        # lora part
+        if self.lora_model_path != "none":
+            self.pipeline = unmerge_lora(self.pipeline, self.lora_model_path, multiplier=lora_alpha_slider)
+
+        sample_config = {
+            "prompt": prompt_textbox,
+            "n_prompt": negative_prompt_textbox,
+            "sampler": sampler_dropdown,
+            "num_inference_steps": sample_step_slider,
+            "guidance_scale": cfg_scale_slider,
+            "width": width_slider,
+            "height": height_slider,
+            "video_length": length_slider,
+            "seed_textbox": seed_textbox
+        }
+        json_str = json.dumps(sample_config, indent=4)
+        with open(os.path.join(self.savedir, "logs.json"), "a") as f:
+            f.write(json_str)
+            f.write("\n\n")
+            
+        if not os.path.exists(self.savedir_sample):
+            os.makedirs(self.savedir_sample, exist_ok=True)
+        index = len([path for path in os.listdir(self.savedir_sample)]) + 1
+        prefix = str(index).zfill(3)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        if is_image or length_slider == 1:
+            save_sample_path = os.path.join(self.savedir_sample, prefix + f".png")
+
+            image = sample[0, :, 0]
+            image = image.transpose(0, 1).transpose(1, 2)
+            image = (image * 255).numpy().astype(np.uint8)
+            image = Image.fromarray(image)
+            image.save(save_sample_path)
+
+            if is_api:
+                return save_sample_path, "Success"
+            else:
+                if gradio_version_is_above_4:
+                    return gr.Image(value=save_sample_path, visible=True), gr.Video(value=None, visible=False), "生成完毕（Success）"
+                else:
+                    return gr.Image.update(value=save_sample_path, visible=True), gr.Video.update(value=None, visible=False), "生成完毕（Success）"
+        else:
+            save_sample_path = os.path.join(self.savedir_sample, prefix + f".mp4")
+            save_videos_grid(sample, save_sample_path, fps=12 if self.edition == "v1" else 24)
+
+            if is_api:
+                return save_sample_path, "Success"
+            else:
+                if gradio_version_is_above_4:
+                    return gr.Image(visible=False, value=None), gr.Video(value=save_sample_path, visible=True), "生成完毕（Success）"
+                else:
+                    return gr.Image.update(visible=False, value=None), gr.Video.update(value=save_sample_path, visible=True), "生成完毕（Success）"
+
+def ui_casdao(model_dir, save_dir, low_gpu_memory_mode, weight_dtype):
+    controller = EasyAnimateController_Casdao(model_dir, save_dir, low_gpu_memory_mode, weight_dtype=weight_dtype)
+    
+    with gr.Blocks(css=css, title="EasyAnimate") as demo:
+        gr.HTML(
+            """
+            <!-- center-->
+                <h1><b>📷 EasyAnimate: 高分辨率长视频生成的端到端解决方案</b></h1>
+                <div class="shields">
+                    <div class="shield">
+                        <a href="https://ai.casdao.com/">
+                            <img src="https://img.shields.io/badge/Casdao-%E6%99%BA%E7%AE%97%E7%A9%BA%E9%97%B4-blue" alt="算力互联-智算空间" height="50">
+                        </a>
+                    </div>
+                    <div class="shield">
+                        <a href="https://easyanimate.github.io/">
+                            <img src="https://img.shields.io/badge/Project-Website-green" alt="项目网站" height="50">
+                        </a>
+                    </div>
+                    <div class="shield">
+                        <a href="https://arxiv.org/abs/2405.18991">
+                            <img src="https://img.shields.io/badge/Arxiv-Page-red" alt="Arxiv 论文" height="50s">
+                        </a>
+                    </div>
+                    <div class="shield">
+                        <a href="https://github.com/aigc-apps/EasyAnimate">
+                            <img src="https://img.shields.io/github/stars/aigc-apps/EasyAnimate?style=social" alt="GitHub标星" height="50">
+                        </a>
+                    </a>
+                </div>
+            <!-- /center -->
+            """
+        )
+        
+        with gr.Column(variant="panel"):
+            gr.Markdown(
+                """
+                ### 1. EasyAnimate版本（EasyAnimate Edition）.
+                """,
+                visible=False
+            )
+            with gr.Row():
+                easyanimate_edition_dropdown = gr.Dropdown(
+                    label="EasyAnimate版本配置（The config of EasyAnimate Edition）",
+                    choices=["v1", "v2", "v3"],
+                    value="v3",
+                    interactive=True,
+                    visible=False
+                )
+            gr.Markdown(
+                """
+                ### 1. 模型选择（Model Settings）
+                """
+            )
+            
+            with gr.Accordion("1.1 基础模型设定（Basic Model Setting）", open=True):
+                with gr.Row():
+                    diffusion_transformer_dropdown = gr.Dropdown(
+                        label="预训练模型路径（Pretrained Model Path）",
+                        choices=controller.diffusion_transformer_list,
+                        value=controller.diffusion_transformer_list[-1] if controller.diffusion_transformer_list is not [] else "none",
+                        interactive=True,
+                    )
+                    diffusion_transformer_dropdown.change(
+                        fn=controller.update_diffusion_transformer, 
+                        inputs=[diffusion_transformer_dropdown], 
+                        outputs=[diffusion_transformer_dropdown]
+                    )
+                    
+                    diffusion_transformer_refresh_button = gr.Button(value="\U0001F503", elem_classes="toolbutton")
+                    def refresh_diffusion_transformer():
+                        controller.refresh_diffusion_transformer()
+                        return gr.update(choices=controller.diffusion_transformer_list)
+                    diffusion_transformer_refresh_button.click(fn=refresh_diffusion_transformer, inputs=[], outputs=[diffusion_transformer_dropdown])
+            
+            with gr.Accordion("1.2 进阶模型设定（Advanced Model Settings）",open=False):    
+                with gr.Row():
+                    motion_module_dropdown = gr.Dropdown(
+                        label="选择运动模块[非必需]（Select motion module [Optional]）",
+                        choices=controller.motion_module_list,
+                        value="none",
+                        interactive=True,
+                        visible=False
+                    )
+
+                    motion_module_refresh_button = gr.Button(value="\U0001F503", elem_classes="toolbutton", visible=False)
+                    def update_motion_module():
+                        controller.refresh_motion_module()
+                        return gr.update(choices=controller.motion_module_list)
+                    motion_module_refresh_button.click(fn=update_motion_module, inputs=[], outputs=[motion_module_dropdown])
+                    
+                    base_model_dropdown = gr.Dropdown(
+                        label="选择基模型[非必需] （Select base Dreambooth model [Optional]）",
+                        choices=controller.personalized_model_list,
+                        value="none",
+                        interactive=True,
+                    )
+                    
+                    lora_model_dropdown = gr.Dropdown(
+                        label="选择LoRA模型[非必需]（Select LoRA model [Optional]）",
+                        choices=["none"] + controller.personalized_model_list,
+                        value="none",
+                        interactive=True,
+                    )
+
+                    lora_alpha_slider = gr.Slider(label="LoRA权重（LoRA alpha）", value=0.55, minimum=0, maximum=2, interactive=True)
+                    
+                    personalized_refresh_button = gr.Button(value="\U0001F503", elem_classes="toolbutton")
+                    def update_personalized_model():
+                        controller.refresh_personalized_model()
+                        return [
+                            gr.update(choices=controller.personalized_model_list),
+                            gr.update(choices=["none"] + controller.personalized_model_list)
+                        ]
+                    personalized_refresh_button.click(fn=update_personalized_model, inputs=[], outputs=[base_model_dropdown, lora_model_dropdown])
+
+        with gr.Column(variant="panel"):
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown(
+                        """
+                        ### 2. 生成提示词（Prompt）
+                        """
+                    )
+                    prompt_textbox = gr.Textbox(
+                        label="正向提示词（Prompt）", 
+                        info="正向提示词（Prompt）输入的文本描述的是你所构思的内容和场景",
+                        lines=2,
+                        placeholder="请用英文输入提示词（Please input prompt with English）",
+                        value="A young woman with beautiful and clear eyes and blonde hair standing and white dress in a forest wearing a crown. She seems to be lost in thought, and the camera focuses on her face. The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic.",
+                        )
+                    negative_prompt_textbox = gr.Textbox(
+                        label="负向提示词（Negative Prompt）", 
+                        info="负向提示词（Negative Prompt）内输入的文字描述的是你不希望在图中包含的内容和场景",
+                        lines=2, 
+                        placeholder="请用英文输入负向提示词（Please input negative prompt with English）",
+                        value="The video is not of a high quality, it has a low resolution, and the audio quality is not clear. Strange motion trajectory, a poor composition and deformed video, low resolution, duplicate and ugly, strange body structure, long and strange neck, bad teeth, bad eyes, bad limbs, bad hands, rotating camera, blurry camera, shaking camera. Deformation, low-resolution, blurry, ugly, distortion." )
+            with gr.Row():
+                with gr.Column():
+                    with gr.Row():
+                        gr.Markdown(
+                            """
+                            ### 3. 生成参数配置（Configs for Generation）
+                            """
+                        )
+                    gr.Markdown(
+                        """
+                        ##### 3.1 设定生成类型
+                        """
+                    )
+                    with gr.Group():
+                        generation_method = gr.Radio(
+                            ["Video Generation", "Image Generation", "Long Video Generation"],
+                            value="Video Generation",
+                            info="从左至右包括视频生成，图片生成和长视频生成",
+                            show_label=False,
+                        )
+                        with gr.Row():
+                            length_slider = gr.Slider(label="视频帧数（Animation length）", value=144, minimum=8,   maximum=144,  step=8)
+                            overlap_video_length = gr.Slider(label="视频续写的重叠帧数（Overlap length）", value=4, minimum=1,   maximum=4,  step=1, visible=False)
+                            partial_video_length = gr.Slider(label="每个部分的视频生成帧数（Partial video generation length）", value=72, minimum=8,   maximum=144,  step=8, visible=False)
+                    
+                    with gr.Accordion("图片到视频（Image to Video）", open=False):
+                        start_image = gr.Image(label="图片到视频的开始图片（The Image at the Beginning of the Video）", show_label=True, elem_id="i2v_start", sources="upload", type="filepath")
+                        
+                        template_gallery_path = ["asset/1.png", "asset/2.png", "asset/3.png", "asset/4.png", "asset/5.png"]
+                        def select_template(evt: gr.SelectData):
+                            text = {
+                                "asset/1.png": "The dog is looking at camera and smiling. The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic.", 
+                                "asset/2.png": "a sailboat sailing in rough seas with a dramatic sunset. The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic.", 
+                                "asset/3.png": "a beautiful woman with long hair and a dress blowing in the wind. The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic.", 
+                                "asset/4.png": "a man in an astronaut suit playing a guitar. The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic.", 
+                                "asset/5.png": "fireworks display over night city. The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic.", 
+                            }[template_gallery_path[evt.index]]
+                            return template_gallery_path[evt.index], text
+
+                        template_gallery = gr.Gallery(
+                            template_gallery_path,
+                            columns=5, rows=1,
+                            height=140,
+                            allow_preview=False,
+                            container=False,
+                            label="模板示例（Template Examples）",
+                        )
+                        template_gallery.select(select_template, None, [start_image, prompt_textbox])
+                        
+                        with gr.Accordion("图片到视频的结束图片[非必需]（The Image at the Ending of the Video [Optional]）", open=False):
+                            end_image   = gr.Image(label="图片到视频的结束图片[非必需]（The Image at the Ending of the Video [Optional]）", show_label=False, elem_id="i2v_end", sources="upload", type="filepath")
+                    
+                    gr.Markdown(
+                        """
+                        ##### 3.2 生成分辨率（Setting for the Resolution of Generation）
+                        """
+                    )    
+                    resize_method = gr.Radio(
+                        ["Generate by", "Resize to the Start Image"],
+                        value="Generate by",
+                        info="从左至右分别是 按照以下设定分辨率生成画面 和 重置画面为预训练模型的基础分辨率",
+                        show_label=False,
+                    )
+                    width_slider     = gr.Slider(label="画面宽度（Width）",            value=672, minimum=128, maximum=1280, step=16)
+                    height_slider    = gr.Slider(label="画面高度（Height）",           value=384, minimum=128, maximum=1280, step=16)
+                    base_resolution  = gr.Radio(label="预训练模型的基础分辨率（Base Resolution of Pretrained Models）", value=960, choices=[512, 768, 960], visible=False)
+                    
+                    gr.Markdown(
+                        """
+                        ##### 3.3 其他生成设置（Other Setting for Generation）
+                        """
+                    )
+                    with gr.Row():
+                        sampler_dropdown   = gr.Dropdown(label="采样器种类（Sampling Method）", choices=list(scheduler_dict.keys()), value=list(scheduler_dict.keys())[0])
+                        sample_step_slider = gr.Slider(label="生成步数（Sampling Steps）", value=30, minimum=10, maximum=100, step=1)
+                    
+                    cfg_scale_slider  = gr.Slider(label="CFG引导系数（CFG Scale ）",
+                                                  info="CFG（Classifier-Free Guidance） 用于控制模型在采样期间应遵循提示词的严格程度，值越大越遵循提示词。",
+                                                  value=7.0, minimum=0, maximum=20)
+                    
+                    with gr.Row():
+                        seed_textbox = gr.Textbox(label="随机种子（Seed）", value=43)
+                        seed_button  = gr.Button(value="\U0001F3B2", elem_classes="toolbutton")
+                        seed_button.click(
+                            fn=lambda: gr.Textbox(value=random.randint(1, 1e8)) if gradio_version_is_above_4 else gr.Textbox.update(value=random.randint(1, 1e8)), 
+                            inputs=[], 
+                            outputs=[seed_textbox]
+                        )
+                        
+                with gr.Column():
+                    gr.Markdown(
+                        """
+                        ### 4. 生成和结果预览（Generation and Preview）
+                        """
+                    )
+                    gr.Markdown(
+                        "生成的结果保存在"+save_dir+"文件夹中，如需修改保存位置请修改init.sh文件中的output参数",
+                    )
+                    result_image = gr.Image(label="生成图片（Generated Image）", interactive=False, visible=False)
+                    result_video = gr.Video(label="生成视频（Generated Animation）", interactive=False)
+                    infer_progress = gr.Textbox(
+                        label="生成信息（Generation Info）",
+                        value="目前无任务（No task currently）",
+                        interactive=False
+                    )
+                    generate_button = gr.Button(value="生成（Generate）", variant='primary')
+
+            def upload_generation_method(generation_method):
+                if generation_method == "Video Generation":
+                    return [gr.update(visible=True, maximum=144, value=144), gr.update(visible=False), gr.update(visible=False)]
+                elif generation_method == "Image Generation":
+                    return [gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)]
+                else:
+                    return [gr.update(visible=True, maximum=1440), gr.update(visible=True), gr.update(visible=True)]
+            generation_method.change(
+                upload_generation_method, generation_method, [length_slider, overlap_video_length, partial_video_length]
+            )
+
+            def upload_resize_method(resize_method):
+                if resize_method == "Generate by":
+                    return [gr.update(visible=True), gr.update(visible=True), gr.update(visible=False)]
+                else:
+                    return [gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)]
+            resize_method.change(
+                upload_resize_method, resize_method, [width_slider, height_slider, base_resolution]
+            )
+
+            easyanimate_edition_dropdown.change(
+                fn=controller.update_edition, 
+                inputs=[easyanimate_edition_dropdown], 
+                outputs=[
+                    easyanimate_edition_dropdown, 
+                    diffusion_transformer_dropdown, 
+                    motion_module_dropdown, 
+                    motion_module_refresh_button, 
+                    width_slider, 
+                    height_slider, 
+                    length_slider, 
+                ]
+            )
+            generate_button.click(
+                fn=controller.generate,
+                inputs=[
+                    diffusion_transformer_dropdown,
+                    motion_module_dropdown,
+                    base_model_dropdown,
+                    lora_model_dropdown,
+                    lora_alpha_slider,
+                    prompt_textbox, 
+                    negative_prompt_textbox, 
+                    sampler_dropdown, 
+                    sample_step_slider, 
+                    resize_method,
+                    width_slider, 
+                    height_slider, 
+                    base_resolution, 
+                    generation_method, 
+                    length_slider, 
+                    overlap_video_length, 
+                    partial_video_length, 
+                    cfg_scale_slider, 
+                    start_image, 
+                    end_image, 
+                    seed_textbox,
+                ],
+                outputs=[result_image, result_video, infer_progress]
+            )
+    return demo, controller
 
 class EasyAnimateController_Modelscope:
     def __init__(self, edition, config_path, model_name, savedir_sample, low_gpu_memory_mode, weight_dtype):
